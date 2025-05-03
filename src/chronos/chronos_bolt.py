@@ -476,6 +476,117 @@ class ChronosBoltPipeline(BaseChronosPipeline):
             loc_scale[1].squeeze(-1).cpu(),
         )
 
+    @torch.inference_mode()
+    def predict_sampling(
+        self,
+        context: Union[torch.Tensor, List[torch.Tensor]],
+        prediction_length: Optional[int] = None,
+        limit_prediction_length: bool = False,
+    ) -> torch.Tensor:
+        """
+        Get forecasts for the given time series via sampling
+
+        Refer to the base method (``BaseChronosPipeline.predict``)
+        for details on shared parameters.
+        Additional parameters
+        ---------------------
+        limit_prediction_length
+            Force prediction length smaller or equal than the
+            built-in prediction length from the model. False by
+            default. When true, fail loudly if longer predictions
+            are requested, otherwise longer predictions are allowed.
+
+        Returns
+        -------
+        torch.Tensor
+            Forecasts of shape (batch_size, num_quantiles, prediction_length)
+            where num_quantiles is the number of quantiles the model has been
+            trained to output. For official Chronos-Bolt models, the value of
+            num_quantiles is 9 for [0.1, 0.2, ..., 0.9]-quantiles.
+
+        Raises
+        ------
+        ValueError
+            When limit_prediction_length is True and the prediction_length is
+            greater than model's trainig prediction_length.
+        """
+        context_tensor = self._prepare_and_validate_context(context=context)
+
+        model_context_length = self.model.config.chronos_config["context_length"]
+        model_prediction_length = self.model.config.chronos_config["prediction_length"]
+        if prediction_length is None:
+            prediction_length = model_prediction_length
+
+        if prediction_length > model_prediction_length:
+            msg = f"We recommend keeping prediction length <= {model_prediction_length}. " "The quality of longer predictions may degrade since the model is not optimized for it. "
+            if limit_prediction_length:
+                msg += "You can turn off this check by setting `limit_prediction_length=False`."
+                raise ValueError(msg)
+            warnings.warn(msg)
+
+        remaining = prediction_length
+
+        # We truncate the context here because otherwise batches with very long
+        # context could take up large amounts of GPU memory unnecessarily.
+        if context_tensor.shape[-1] > model_context_length:
+            context_tensor = context_tensor[..., -model_context_length:]
+
+        # Figure out device (cuda, mps or cpu)
+        device = torch.device(self.model.device)
+        context_tensor = context_tensor.to(device=device, dtype=torch.float32)
+
+        # Monte-Carlo settings
+        K = 20  # total MC paths needed
+        max_batch = 64  # ≤ this many samples on device at once
+        B = context_tensor.size(0)
+        chunk_k = max(1, max_batch // B)
+        step_size = 64
+
+        quantile_levels = torch.tensor(self.quantiles, device=device)
+        path_chunks = []  # will store CPU tensors of shape (B, chunk_k, horizon)
+
+        for k0 in range(0, K, chunk_k):
+            this_k = min(chunk_k, K - k0)
+            # replicate context
+            ctx = context_tensor.repeat_interleave(this_k, dim=0)
+            remaining = prediction_length
+            # for this chunk we build up a list of (B, this_k, take) blocks
+            chunk_blocks = []
+
+            while remaining > 0:
+
+                preds = self.model(context=ctx).quantile_preds
+                u = torch.rand(preds.size(0), preds.size(-1), device=device)
+                sample = sample_from_quantiles(preds, quantile_levels, u)
+                take = min(remaining, step_size)
+
+                # slice & reshape to (B, this_k, take)
+                block = sample[:, :take]
+                chunk_blocks.append(block.view(B, this_k, take).cpu())  # immediately move to CPU
+
+                # feed back into ctx
+                ctx = torch.cat([ctx, block], dim=-1)[..., -model_context_length:].detach()
+                remaining -= take
+
+            # build the full (B, this_k, horizon) on CPU
+            chunk_path = torch.cat(chunk_blocks, dim=-1)
+            path_chunks.append(chunk_path)
+
+        # combine all chunks → (B, K, horizon) on CPU
+        paths = torch.cat(path_chunks, dim=1)
+
+        # compute final quantiles on CPU
+        final_q = torch.quantile(
+            paths,
+            q=quantile_levels.cpu(),
+            dim=1,
+            interpolation="nearest",
+        ).permute(
+            1, 0, 2
+        )  # → (B, num_q, horizon)
+
+        return final_q
+
     def predict(  # type: ignore[override]
         self,
         context: Union[torch.Tensor, List[torch.Tensor]],
@@ -638,3 +749,54 @@ class ChronosBoltPipeline(BaseChronosPipeline):
 
         model = class_.from_pretrained(*args, **kwargs)
         return cls(model=model)
+
+
+def sample_from_quantiles(preds: torch.Tensor, q_train: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """
+    helper: inverse-CDF sampling from Chronos-Bolt quantile output
+    inverse-CDF sampling from Chronos-Bolt quantile output
+
+    Parameters
+    ----------
+    preds   : Tensor, shape = (B, Q=9, L)
+        Quantile predictions coming out of Chronos-Bolt for one forward pass.
+        For every series in the batch (B) and every future step (L) we have
+        Q = 9 quantile values, corresponding to q_train.
+
+    q_train : Tensor, shape = (Q,)
+        Sorted tensor  [0.1, 0.2, …, 0.9]  — the quantile levels the model was
+        trained on.  (We assume they are strictly increasing.)
+
+    u       : Tensor, shape = (B, L)
+        Independent draws from U(0, 1).  Each element u[b, t] is the *quantile
+        level* that we want to realise for series b at horizon step t.
+
+    Returns
+    -------
+    sample  : Tensor, shape = (B, L)
+        One concrete numerical sample per series and time step, produced
+        by *inverting* the piece-wise linear CDF defined by `preds`.
+    """
+
+    # ------------------------------------------------------------------ 1. locate bins
+    # For every u[b, t] find the *index* of the smallest training level ≥ u.
+    # E.g. if u = 0.37 the first q_train ≥ 0.37 is q_train[2] = 0.3? 0.4? etc.
+    idx_hi = torch.searchsorted(sorted_sequence=q_train, input=u, right=False)  # (B, L) in 0..Q
+    idx_hi = idx_hi.clamp(max=len(q_train) - 1)  # cap at Q-1
+    idx_lo = (idx_hi - 1).clamp(min=0)  # lower neighbour
+
+    # Fetch the *levels* themselves for later interpolation weights
+    q_lo = q_train[idx_lo]  # (B, L)
+    q_hi = q_train[idx_hi]  # (B, L)
+
+    # ----------------------------------------------------------- 2. gather values v(q)
+    # preds has dim-1 = quantile dimension ⇒ gather along dim = 1
+    # We need the value predicted at q_lo and q_hi for every (b, t).
+    v_lo = torch.gather(preds, 1, idx_lo.unsqueeze(1)).squeeze(1)  # (B, L)
+    v_hi = torch.gather(preds, 1, idx_hi.unsqueeze(1)).squeeze(1)  # (B, L)
+
+    # --------------------------------------------------- 3. linear interpolation
+    #   v(u) = v_lo + w · (v_hi - v_lo)   where  w = (u - q_lo)/(q_hi - q_lo)
+    denom = (q_hi - q_lo).clamp(min=1e-12)  # avoid /0 at edges
+    w = (u - q_lo) / denom  # relative position of u inside the bin
+    return v_lo + w * (v_hi - v_lo)  # (B, L)
