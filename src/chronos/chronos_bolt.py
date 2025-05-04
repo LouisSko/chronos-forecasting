@@ -510,8 +510,6 @@ class ChronosBoltPipeline(BaseChronosPipeline):
             When limit_prediction_length is True and the prediction_length is
             greater than model's trainig prediction_length.
         """
-        context_tensor = self._prepare_and_validate_context(context=context)
-
         model_context_length = self.model.config.chronos_config["context_length"]
         model_prediction_length = self.model.config.chronos_config["prediction_length"]
         if prediction_length is None:
@@ -524,68 +522,59 @@ class ChronosBoltPipeline(BaseChronosPipeline):
                 raise ValueError(msg)
             warnings.warn(msg)
 
-        remaining = prediction_length
+        # ------------------------------------------------------------- build ctx
+        ctx = self._prepare_and_validate_context(context).to(self.model.device, torch.float32)
+        if ctx.shape[-1] > model_context_length:  # truncate long context
+            ctx = ctx[..., -model_context_length:]
 
-        # We truncate the context here because otherwise batches with very long
-        # context could take up large amounts of GPU memory unnecessarily.
-        if context_tensor.shape[-1] > model_context_length:
-            context_tensor = context_tensor[..., -model_context_length:]
+        # ------------------------------------------------ deterministic forecast
+        init_pred = self.model(context=ctx).quantile_preds  # (B, Q, model_prediction_length)
+        if prediction_length <= model_prediction_length:  # early exit
+            return init_pred[..., :prediction_length].to("cpu", torch.float32)
 
-        # Figure out device (cuda, mps or cpu)
-        device = torch.device(self.model.device)
-        context_tensor = context_tensor.to(device=device, dtype=torch.float32)
+        # ------------------------------------------------ Monte‑Carlo parameters
+        B = ctx.size(0)
+        num_paths = 40  # total paths
+        max_batch = 64  # GPU safety cap
+        paths_per_loop = max(1, max_batch // B)  # split work
+        quantiles_t = torch.tensor(self.quantiles, device=self.model.device)
 
-        # Monte-Carlo settings
-        K = 20  # total MC paths needed
-        max_batch = 64  # ≤ this many samples on device at once
-        B = context_tensor.size(0)
-        chunk_k = max(1, max_batch // B)
-        step_size = 64
+        # --------------------------------------------------------- roll‑out loop for efficiency
+        remain = prediction_length - model_prediction_length
+        all_paths_cpu: List[torch.Tensor] = []  # (B, num_paths, remain)
 
-        quantile_levels = torch.tensor(self.quantiles, device=device)
-        path_chunks = []  # will store CPU tensors of shape (B, chunk_k, horizon)
+        for k_start in range(0, num_paths, paths_per_loop):
+            k_chunk = min(paths_per_loop, num_paths - k_start)
 
-        for k0 in range(0, K, chunk_k):
-            this_k = min(chunk_k, K - k0)
-            # replicate context
-            ctx = context_tensor.repeat_interleave(this_k, dim=0)
-            remaining = prediction_length
-            # for this chunk we build up a list of (B, this_k, take) blocks
-            chunk_blocks = []
+            # ----- first step: sample from deterministic head
+            sample = sample_from_quantiles(init_pred, quantiles_t)  # (B, model_prediction_length)
 
-            while remaining > 0:
+            # build replicated context for this chunk
+            ctx_k = torch.cat([ctx, sample], dim=-1)[..., -model_context_length:].detach()
+            ctx_k = ctx_k.repeat_interleave(k_chunk, dim=0)
 
-                preds = self.model(context=ctx).quantile_preds
-                u = torch.rand(preds.size(0), preds.size(-1), device=device)
-                sample = sample_from_quantiles(preds, quantile_levels, u)
-                take = min(remaining, step_size)
+            blocks: List[torch.Tensor] = []
+            left = remain
+            while left > 0:
+                pred = self.model(context=ctx_k).quantile_preds  # (N, Q, model_prediction_length)
+                sample = sample_from_quantiles(pred, quantiles_t)  # (N, model_prediction_length)
 
-                # slice & reshape to (B, this_k, take)
-                block = sample[:, :take]
-                chunk_blocks.append(block.view(B, this_k, take).cpu())  # immediately move to CPU
+                take = min(left, model_prediction_length)
+                block = sample[:, :take]  # (N, take)
+                blocks.append(block.view(B, k_chunk, take).cpu())
 
-                # feed back into ctx
-                ctx = torch.cat([ctx, block], dim=-1)[..., -model_context_length:].detach()
-                remaining -= take
+                ctx_k = torch.cat([ctx_k, block], dim=-1)[..., -model_context_length:].detach()
+                left -= take
 
-            # build the full (B, this_k, horizon) on CPU
-            chunk_path = torch.cat(chunk_blocks, dim=-1)
-            path_chunks.append(chunk_path)
+            all_paths_cpu.append(torch.cat(blocks, dim=-1))  # (B, k_chunk, remain)
 
-        # combine all chunks → (B, K, horizon) on CPU
-        paths = torch.cat(path_chunks, dim=1)
+        # ------------------------------------------------ aggregate quantiles
+        paths = torch.cat(all_paths_cpu, dim=1)  # (B, num_paths, remain)
+        mc_pred = torch.quantile(paths, q=quantiles_t.cpu(), dim=1, interpolation="nearest").permute(1, 0, 2)  # (B, Q, remain)
 
-        # compute final quantiles on CPU
-        final_q = torch.quantile(
-            paths,
-            q=quantile_levels.cpu(),
-            dim=1,
-            interpolation="nearest",
-        ).permute(
-            1, 0, 2
-        )  # → (B, num_q, horizon)
+        # ------------------------------------------------ concatenate & return
+        return torch.cat([init_pred.cpu(), mc_pred], dim=-1).to(dtype=torch.float32, device="cpu")  # (B, Q, prediction_length)
 
-        return final_q
 
     def predict(  # type: ignore[override]
         self,
@@ -751,14 +740,14 @@ class ChronosBoltPipeline(BaseChronosPipeline):
         return cls(model=model)
 
 
-def sample_from_quantiles(preds: torch.Tensor, q_train: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+def sample_from_quantiles(preds: torch.Tensor, q_train: torch.Tensor) -> torch.Tensor:
     """
     helper: inverse-CDF sampling from Chronos-Bolt quantile output
     inverse-CDF sampling from Chronos-Bolt quantile output
 
     Parameters
     ----------
-    preds   : Tensor, shape = (B, Q=9, L)
+    preds : Tensor, shape = (B, Q=9, L)
         Quantile predictions coming out of Chronos-Bolt for one forward pass.
         For every series in the batch (B) and every future step (L) we have
         Q = 9 quantile values, corresponding to q_train.
@@ -767,16 +756,15 @@ def sample_from_quantiles(preds: torch.Tensor, q_train: torch.Tensor, u: torch.T
         Sorted tensor  [0.1, 0.2, …, 0.9]  — the quantile levels the model was
         trained on.  (We assume they are strictly increasing.)
 
-    u       : Tensor, shape = (B, L)
-        Independent draws from U(0, 1).  Each element u[b, t] is the *quantile
-        level* that we want to realise for series b at horizon step t.
-
     Returns
     -------
-    sample  : Tensor, shape = (B, L)
+    sample : Tensor, shape = (B, L)
         One concrete numerical sample per series and time step, produced
         by *inverting* the piece-wise linear CDF defined by `preds`.
     """
+    # Tensor, shape = (B, L). Independent draws from U(0, 1).
+    # Each element u[b, t] is the quantile level that we want to realise for series b at horizon step t.
+    u = torch.rand(preds.size(0), preds.size(-1), device=preds.device)
 
     # ------------------------------------------------------------------ 1. locate bins
     # For every u[b, t] find the *index* of the smallest training level ≥ u.
