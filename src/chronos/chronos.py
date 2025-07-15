@@ -20,6 +20,8 @@ from transformers import (
 import chronos
 from chronos.base import BaseChronosPipeline, ForecastType
 from chronos.utils import left_pad_and_stack_1D
+import numpy as np
+import random
 
 logger = logging.getLogger(__file__)
 
@@ -347,6 +349,12 @@ class ChronosModel(nn.Module):
             top_p = self.config.top_p
 
         assert hasattr(self.model, "generate")
+
+        random.seed(42)
+        np.random.seed(42)
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        torch.cuda.manual_seed_all(42)
 
         preds = self.model.generate(
             input_ids=input_ids,
